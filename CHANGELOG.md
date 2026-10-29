@@ -19,8 +19,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Response capture for gRPC: `response.body` (last message), `response.status` (gRPC code), `response.headers.valueOf()` (headers and trailers)
 - JetBrains `SSLConfiguration` in environment files (`clientCertificate`, `clientCertificateKey`, `verifyHostCertificate`)
 - `examples/grpc.http` and `examples/proto/hello.proto`
+- Paste a `curl` or `grpcurl` command in a `.http` file: the LSP replaces it with a request block (JetBrains behavior). `Cmd+Z` gets the command back. Set `"convertPastedCurl": false` in `lsp.http-lsp.initialization_options` to turn it off
+- Code actions: Convert cURL to HTTP request, Convert grpcurl to gRPC request
+- curl conversion: method, headers, `-d`/`--data-*`/`--json`, `-F` multipart, `-u` basic auth, `--oauth2-bearer`, cookies, `-G`, `-I`, `-T`; Chrome "Copy as cURL (bash)" quoting (`$'...'`)
+- grpcurl conversion: TLS or `-plaintext`, `-d` messages, `-H` metadata, flags to directives (`-proto` → `# @proto`, `-max-time` → `# @timeout`, ...)
+- HTTP request bodies from a file (`< ./file`) and `multipart/form-data` bodies with `< ./file` parts
+- 📋 Generate cURL: a `< ./file` body becomes `--data-binary @file`
 
 ### Changed
+- A body is a file reference only when it is one `< path` line. A body that starts with `<` and has no space after it (for example `<?xml ...>`) is inline text
 - Grammar: fork of tree-sitter-http with the `GRPC` method, so `GRPC` highlights as a keyword
 - `install_to_zed.sh` builds the grammar at the `rev` of `extension.toml` and checks for grpcurl
 

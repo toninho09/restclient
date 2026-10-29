@@ -39,7 +39,7 @@ Completely quit Zed (`Cmd+Q` on macOS) and reopen it.
 
 Open any file from the `examples/` directory:
 
-- `examples/basic.http` — GET, POST, PUT, PATCH, DELETE
+- `examples/basic.http` — GET, POST, PUT, PATCH, DELETE, file body, multipart upload
 - `examples/variables.http` — File-level variables, nested resolution
 - `examples/response-capture.http` — Save values from responses
 - `examples/edge-cases.http` — Error codes, slow requests, response formats
@@ -92,6 +92,8 @@ Click the **📋 Generate cURL** button to copy the request as a cURL command to
 - **gRPC Requests** — `GRPC host:port/package.Service/Method` (JetBrains syntax), run with grpcurl: unary, server/client/bidirectional streaming, TLS, metadata
 - **📋 Copy as grpcurl / 🔍 Describe gRPC** — Copy a gRPC request as a grpcurl command, or show the method signature and a request template
 - **gRPC Completion** — Services, methods, and request message fields from server reflection or `.proto` files
+- **Paste cURL / grpcurl** — Paste a `curl` or `grpcurl` command and it becomes a request block (JetBrains behavior). The `Cmd+.` code action also converts a command.
+- **File Bodies and Multipart** — `< ./file` bodies and `multipart/form-data` uploads with `< ./file` parts
 
 ---
 
@@ -145,6 +147,39 @@ Variables work in URLs, header values, and request bodies. Nested resolution is 
 
 GET {{baseUrl}}/api/users
 ```
+
+### Request Body from a File
+
+```http
+### Send the content of a file
+POST https://api.example.com/users
+Content-Type: application/json
+
+< ./data/user.json
+```
+
+The path starts from the directory of the `.http` file.
+
+### Multipart Upload
+
+```http
+### Upload a file with a form field
+POST https://api.example.com/upload
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="name"
+
+Ada
+--WebAppBoundary
+Content-Disposition: form-data; name="notes"; filename="notes.txt"
+Content-Type: text/plain
+
+< ./data/notes.txt
+--WebAppBoundary--
+```
+
+A `< path` line in a multipart body sends the bytes of the file.
 
 ### Response Variable Capture
 
@@ -334,6 +369,105 @@ The LSP keeps grpcurl results for 60 seconds.
 
 ---
 
+## Paste cURL and grpcurl
+
+Paste a `curl` or `grpcurl` command in a `.http` file. The extension replaces it with a request block, as in JetBrains.
+
+```bash
+curl -X POST https://api.example.com/users \
+  -H 'Content-Type: application/json' \
+  -u admin:secret \
+  -d '{"name":"Ada"}'
+```
+
+becomes:
+
+```http
+POST https://api.example.com/users
+Content-Type: application/json
+Authorization: Basic YWRtaW46c2VjcmV0
+
+{
+  "name": "Ada"
+}
+```
+
+```bash
+grpcurl -plaintext -H 'authorization: Bearer t' -d '{"greeting":"Zed"}' \
+  grpcb.in:9000 hello.HelloService/SayHello
+```
+
+becomes:
+
+```http
+GRPC grpcb.in:9000/hello.HelloService/SayHello
+authorization: Bearer t
+
+{
+  "greeting": "Zed"
+}
+```
+
+- The command must be on its own lines. The extension does not convert a command in a comment or after other text.
+- Press `Cmd+Z` to get the original command back. The extension does not convert it again.
+- To convert a command that is already in the file, put the cursor on it and press `Cmd+.` (code action **Convert cURL to HTTP request** / **Convert grpcurl to gRPC request**).
+- You can paste many commands at the same time. Each one becomes a request, with `###` between them.
+- If the block already has a request, the extension adds a `###` separator.
+- Commands copied from browser developer tools ("Copy as cURL (bash)") work, also with `$'...'` quoting.
+
+### curl Options
+
+| curl | Request |
+|---|---|
+| `-X`, `--request` | Method. Without `-X`: `-I` → `HEAD`, `-T` → `PUT`, data or form → `POST`, else `GET` |
+| `-H`, `--header` | Header |
+| `-d`, `--data`, `--data-binary`, `--data-raw` | Body. Many `-d` values join with `&`. `-d @file` → `< ./file` |
+| `--data-urlencode` | Body, percent-encoded |
+| `--json` | Body, `Content-Type` and `Accept: application/json` |
+| `-F`, `--form`, `--form-string` | `multipart/form-data` body. `name=@file` → file part, `name=<file` → text part from a file |
+| `-u`, `--user` | `Authorization: Basic ...` |
+| `--oauth2-bearer` | `Authorization: Bearer ...` |
+| `-A`, `-e`, `-b name=value` | `User-Agent`, `Referer`, `Cookie` |
+| `-G`, `--get` | The data goes in the query string |
+| `-T`, `--upload-file` | `PUT` with a `< ./file` body |
+
+`-d` without a `Content-Type` header adds `Content-Type: application/x-www-form-urlencoded`, as curl does. The extension ignores options that do not change the request, such as `-s`, `-L`, `-k`, `-o`, and `--compressed`.
+
+### grpcurl Flags
+
+| grpcurl | Request |
+|---|---|
+| no `-plaintext` (grpcurl uses TLS) | `GRPC grpcs://host:port/...` |
+| `-plaintext` | `GRPC host:port/...` |
+| `-d` | Body (one or more messages). `-d @` (stdin) gives no body |
+| `-H`, `-rpc-header`, `-reflect-header` | Metadata |
+| `-proto`, `-import-path`, `-protoset`, `-cacert`, `-cert`, `-key`, `-authority` | Directive with the same name (`# @proto ...`) |
+| `-max-time`, `-connect-timeout` | `# @timeout`, `# @connection-timeout` |
+| `-insecure`, `-emit-defaults` | `# @insecure`, `# @emit-defaults` |
+| `host:port list [service]` | `GRPC host:port[/service]` |
+
+grpcurl reads relative paths from the shell directory. Directives read them from the directory of the `.http` file. Examine the paths after a conversion.
+
+### Turn Off the Conversion on Paste
+
+Add this to your Zed `settings.json`, then restart Zed:
+
+```json
+{
+  "lsp": {
+    "http-lsp": {
+      "initialization_options": {
+        "convertPastedCurl": false
+      }
+    }
+  }
+}
+```
+
+The `Cmd+.` code action continues to work.
+
+---
+
 ## File Format
 
 The extension supports the [JetBrains HTTP Client file format](https://www.jetbrains.com/help/idea/http-client-in-product-code-editor.html):
@@ -462,6 +596,8 @@ restclient/
 │   │   ├── main.rs         # LSP server (completions, symbols, diagnostics)
 │   │   ├── parser.rs       # HTTP file parser
 │   │   ├── grpc.rs         # gRPC targets, grpcurl arguments, grpcurl output parser
+│   │   ├── convert.rs      # curl/grpcurl command → request block (paste and code action)
+│   │   ├── body.rs         # HTTP request body: inline, < file, multipart
 │   │   ├── variables.rs    # Variable resolution
 │   │   ├── response_handler.rs  # Response variable capture
 │   │   └── bin/
@@ -483,6 +619,7 @@ restclient/
 │   ├── edge-cases.http     # Error codes, slow requests, formats
 │   ├── environments.rest   # Environment variables example
 │   ├── grpc.http           # gRPC calls (requires grpcurl)
+│   ├── data/               # Files for the file body and multipart examples
 │   └── proto/hello.proto   # Schema for the @proto example
 ├── grammars/               # Tree-sitter grammar (fork of tree-sitter-http with the GRPC method)
 ├── extension.toml          # Extension manifest

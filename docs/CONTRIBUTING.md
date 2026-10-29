@@ -36,6 +36,8 @@ restclient/
 │   │   ├── main.rs             # LSP server (code lens, completions, symbols, runnables)
 │   │   ├── parser.rs           # HTTP file parser
 │   │   ├── grpc.rs             # gRPC targets, grpcurl arguments, grpcurl output parser
+│   │   ├── convert.rs          # curl/grpcurl command → request block (paste and code action)
+│   │   ├── body.rs             # HTTP request body: inline, < file, multipart
 │   │   ├── variables.rs        # Variable resolution engine
 │   │   ├── lib.rs              # Shared library exports
 │   │   └── bin/
@@ -56,7 +58,11 @@ restclient/
 
 **WASM Extension** (`src/lib.rs`): Entry point registered with Zed. Locates and launches the LSP binary. Cannot use tokio/reqwest (WASM constraint).
 
-**LSP Server** (`lsp/src/main.rs`): Provides code lens (Generate cURL), completions, document symbols, and runnables. Independent workspace crate.
+**LSP Server** (`lsp/src/main.rs`): Provides code lens (Generate cURL), completions, document symbols, runnables, and code actions. It converts pasted curl/grpcurl commands with `workspace/applyEdit`. Independent workspace crate.
+
+**Command Conversion** (`lsp/src/convert.rs`): Splits shell text into words, converts `curl` and `grpcurl` arguments to request blocks, and finds pasted commands. `did_change` compares the old and the new text. The inserted text must start with a command, so typing never converts.
+
+**Request Body** (`lsp/src/body.rs`): Builds the bytes of an HTTP body for the CLI: inline text, `< ./file` references, and `multipart/form-data` bodies with `< ./file` parts (CRLF line breaks).
 
 **HTTP Parser** (`lsp/src/parser.rs`): Parses `.http` files into structured request blocks. Handles methods (including `GRPC`), headers, bodies, variables, `# @directive` comments, and `###` separators.
 

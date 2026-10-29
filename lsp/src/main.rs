@@ -1,6 +1,6 @@
 mod completions;
 
-use http_lsp::{grpc, parser, variables};
+use http_lsp::{convert, grpc, parser, variables};
 
 use completions::{
     header_values, AUTH_SCHEMES, FLAG_DIRECTIVES, GRPC_METADATA_NAMES, HEADER_NAMES, HTTP_METHODS,
@@ -15,6 +15,7 @@ use variables::VariableResolver;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -54,6 +55,8 @@ struct Document {
     content: String,
     version: i32,
     requests: Vec<HttpRequest>,
+    /// The text of the last automatic conversion of a pasted command
+    last_conversion: Option<String>,
 }
 
 /// Time limit for one grpcurl call during completion
@@ -66,11 +69,16 @@ const GRPCURL_FAILURE_TTL: Duration = Duration::from_secs(10);
 /// grpcurl stdout by arguments. `None` means the call failed.
 type GrpcurlCache = HashMap<Vec<String>, (Instant, Option<String>)>;
 
+/// `initialization_options` key. `false` stops the conversion of pasted curl/grpcurl commands.
+const CONVERT_PASTED_OPTION: &str = "convertPastedCurl";
+
 #[derive(Debug)]
 struct HttpLsp {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     grpcurl_cache: Arc<RwLock<GrpcurlCache>>,
+    /// Convert pasted curl/grpcurl commands to requests
+    convert_pasted: AtomicBool,
 }
 
 impl HttpLsp {
@@ -79,6 +87,7 @@ impl HttpLsp {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             grpcurl_cache: Arc::new(RwLock::new(HashMap::new())),
+            convert_pasted: AtomicBool::new(true),
         }
     }
 
@@ -104,6 +113,7 @@ impl HttpLsp {
                 content: doc.content.clone(),
                 version: doc.version,
                 requests: doc.requests.clone(),
+                last_conversion: None,
             });
         }
         drop(docs);
@@ -116,6 +126,7 @@ impl HttpLsp {
             content,
             version: 0,
             requests,
+            last_conversion: None,
         })
     }
 
@@ -428,6 +439,23 @@ fn is_grpc_request_line(line: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
+/// The LSP edit of a converted curl/grpcurl command
+fn replacement_edit(replacement: &convert::Replacement) -> TextEdit {
+    TextEdit {
+        range: Range {
+            start: Position {
+                line: replacement.start_line,
+                character: 0,
+            },
+            end: Position {
+                line: replacement.end_line,
+                character: replacement.end_character,
+            },
+        },
+        new_text: replacement.new_text.clone(),
+    }
+}
+
 /// Complete comment directives: `# @name`, `// @timeout`
 fn directive_completions(before_cursor: &str, position: Position) -> Option<CompletionResponse> {
     let at = before_cursor.rfind('@')?;
@@ -470,13 +498,30 @@ fn directive_completions(before_cursor: &str, position: Position) -> Option<Comp
 
 #[tower_lsp::async_trait]
 impl LanguageServer for HttpLsp {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let enabled = params
+            .initialization_options
+            .as_ref()
+            .and_then(|options| options.get(CONVERT_PASTED_OPTION))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        // The conversion of pasted commands sends `workspace/applyEdit` to the client
+        let apply_edit = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.apply_edit)
+            .unwrap_or(false);
+        self.convert_pasted
+            .store(enabled && apply_edit, Ordering::Relaxed);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(
@@ -509,6 +554,7 @@ impl LanguageServer for HttpLsp {
             content,
             version,
             requests,
+            last_conversion: None,
         };
         let mut docs = self.documents.write().await;
         docs.insert(uri, doc);
@@ -518,16 +564,68 @@ impl LanguageServer for HttpLsp {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        if let Some(change) = params.content_changes.into_iter().last() {
-            let requests = parse_http_file(&change.text).unwrap_or_default();
-            let doc = Document {
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+
+        let mut docs = self.documents.write().await;
+        let previous = docs.remove(&uri);
+        let mut last_conversion = previous.as_ref().and_then(|d| d.last_conversion.clone());
+
+        let pasted = previous
+            .filter(|_| self.convert_pasted.load(Ordering::Relaxed))
+            .and_then(|d| convert::pasted_replacement(&d.content, &change.text))
+            // An undo of a conversion puts the command back: do not convert it again
+            .filter(|(_, removed)| {
+                let removed = removed.trim();
+                removed.is_empty()
+                    || !last_conversion
+                        .as_deref()
+                        .is_some_and(|text| text.contains(removed))
+            })
+            .map(|(replacement, _)| replacement);
+        if let Some(replacement) = &pasted {
+            last_conversion = Some(replacement.new_text.clone());
+        }
+
+        let requests = parse_http_file(&change.text).unwrap_or_default();
+        docs.insert(
+            uri.clone(),
+            Document {
                 content: change.text,
                 version,
                 requests,
-            };
-            let mut docs = self.documents.write().await;
-            docs.insert(uri, doc);
-        }
+                last_conversion,
+            },
+        );
+        drop(docs);
+
+        let Some(replacement) = pasted else {
+            return;
+        };
+        // The version makes the client reject the edit if the document changed again
+        let edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: Some(version),
+                },
+                edits: vec![OneOf::Left(replacement_edit(&replacement))],
+            }])),
+            ..Default::default()
+        };
+        // Do not wait for the response here: the client sends a didChange before it
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.apply_edit(edit).await {
+                client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Failed to convert the pasted command: {}", e),
+                    )
+                    .await;
+            }
+        });
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -959,6 +1057,39 @@ impl LanguageServer for HttpLsp {
         } else {
             Ok(Some(CompletionResponse::Array(items)))
         }
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let docs = self.documents.read().await;
+        let Some(doc) = docs.get(&uri) else {
+            return Ok(None);
+        };
+
+        let line = params.range.start.line as usize;
+        let Some(replacement) = convert::command_at(&doc.content, line)
+            .and_then(|(start, end)| convert::convert_lines(&doc.content, start, end))
+        else {
+            return Ok(None);
+        };
+
+        let title = match replacement.kind {
+            convert::CommandKind::Curl => "Convert cURL to HTTP request",
+            convert::CommandKind::Grpcurl => "Convert grpcurl to gRPC request",
+        };
+        let edit = WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![replacement_edit(&replacement)],
+            )])),
+            ..Default::default()
+        };
+        Ok(Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: title.to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(edit),
+            ..Default::default()
+        })]))
     }
 
     async fn shutdown(&self) -> Result<()> {

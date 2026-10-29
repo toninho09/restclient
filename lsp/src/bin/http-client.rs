@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use http_lsp::body;
 use http_lsp::grpc::{
     self, GrpcCall, GrpcEvent, GrpcOptions, GrpcStatus, GrpcTarget, VerboseParser,
 };
@@ -83,6 +84,11 @@ fn main() {
         process::exit(1);
     });
 
+    // Absolute, so that the copied commands work in all directories
+    let base_dir = env::current_dir()
+        .map(|cwd| cwd.join(file_parent))
+        .unwrap_or_else(|_| file_parent.to_path_buf());
+
     if request.method == HttpMethod::GRPC {
         let mode = if curl_mode {
             GrpcMode::Copy
@@ -95,9 +101,6 @@ fn main() {
             print_request_header(request);
         }
 
-        let base_dir = env::current_dir()
-            .map(|cwd| cwd.join(file_parent))
-            .unwrap_or_else(|_| file_parent.to_path_buf());
         let ssl = resolver.get_ssl_configuration();
         if let Err(e) = run_grpc(request, mode, &mut globals, &base_dir, ssl) {
             println!("{RED}{BOLD}✗ Request failed:{RESET} {RED}{e}{RESET}");
@@ -112,7 +115,7 @@ fn main() {
     }
 
     if curl_mode {
-        generate_curl(request);
+        generate_curl(request, &base_dir);
     } else {
         print_request_header(request);
 
@@ -126,7 +129,7 @@ fn main() {
     }
 }
 
-fn generate_curl(request: &HttpRequest) {
+fn generate_curl(request: &HttpRequest, base_dir: &Path) {
     let mut parts = vec![
         "curl".to_string(),
         "-X".to_string(),
@@ -139,9 +142,23 @@ fn generate_curl(request: &HttpRequest) {
         parts.push(shell_quote(&format!("{}: {}", name, value)));
     }
 
-    if let Some(RequestBody::Inline(body)) = &request.body {
-        parts.push("--data-raw".to_string());
-        parts.push(shell_quote(body));
+    match &request.body {
+        Some(RequestBody::Inline(body)) => {
+            parts.push("--data-raw".to_string());
+            parts.push(shell_quote(body));
+        }
+        Some(RequestBody::FileReference(path)) => {
+            parts.push("--data-binary".to_string());
+            parts.push(shell_quote(&format!(
+                "@{}",
+                base_dir
+                    .join(path)
+                    .components()
+                    .collect::<PathBuf>()
+                    .display()
+            )));
+        }
+        _ => {}
     }
 
     copy_command(&parts.join(" "));
@@ -246,13 +263,8 @@ fn execute_request(
         req_builder = req_builder.header(name, value);
     }
 
-    if let Some(ref body) = request.body {
-        match body {
-            RequestBody::Inline(s) => {
-                req_builder = req_builder.body(s.clone());
-            }
-            _ => return Err("File references not supported".to_string()),
-        }
+    if let Some(body) = body::request_body(request, http_file_dir)? {
+        req_builder = req_builder.body(body);
     }
 
     let start = Instant::now();

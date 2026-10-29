@@ -357,12 +357,10 @@ fn parse_request_block(
     } else {
         let body_text = body_lines.join("\n").trim().to_string();
 
-        // Check for file reference
-        if let Some(stripped) = body_text.strip_prefix("<") {
-            let file_path = stripped.trim();
-            Some(RequestBody::FileReference(PathBuf::from(file_path)))
-        } else {
-            Some(RequestBody::Inline(body_text))
+        // Check for file reference: one line `< ./file.json` (an XML body also starts with `<`)
+        match file_reference(&body_text).filter(|_| !body_text.contains('\n')) {
+            Some(file_path) => Some(RequestBody::FileReference(PathBuf::from(file_path))),
+            None => Some(RequestBody::Inline(body_text)),
         }
     };
 
@@ -407,6 +405,16 @@ fn parse_directive(line: &str) -> Option<(String, Option<String>)> {
     let value = rest[name_end..].trim_start_matches('=').trim();
     let value = (!value.is_empty()).then(|| value.to_string());
     Some((name.to_string(), value))
+}
+
+/// Return the path of a file reference line: `< ./file.json`.
+/// The `<` must have white space after it, so `<?xml ...>` is not a file reference.
+pub fn file_reference(line: &str) -> Option<&str> {
+    let path = line.trim().strip_prefix('<')?;
+    if !path.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(path.trim()).filter(|p| !p.is_empty())
 }
 
 /// Find the request at the 1-based `line`. A line between blocks (for example a `###`

@@ -64,3 +64,24 @@ Authorization: Bearer my-secret-token
 ### Basic auth
 GET https://httpbin.org/basic-auth/user/passwd
 Authorization: Basic dXNlcjpwYXNzd2Q=
+
+### POST a JSON file (curl -d @data/user.json)
+POST https://httpbin.org/post
+Content-Type: application/json
+
+< ./data/user.json
+
+### Multipart upload (curl -F name=Ada -F notes=@data/notes.txt)
+POST https://httpbin.org/post
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="name"
+
+Ada
+--WebAppBoundary
+Content-Disposition: form-data; name="notes"; filename="notes.txt"
+Content-Type: text/plain
+
+< ./data/notes.txt
+--WebAppBoundary--
