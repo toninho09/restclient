@@ -1,0 +1,24 @@
+// Schema of hello.HelloService on grpcb.in (https://grpcb.in).
+// Exported from server reflection with: grpcurl -plaintext -proto-out-dir . grpcb.in:9000 describe hello.HelloService
+
+syntax = "proto2";
+
+package hello;
+
+message HelloRequest {
+  optional string greeting = 1;
+}
+
+message HelloResponse {
+  required string reply = 1;
+}
+
+service HelloService {
+  rpc SayHello ( HelloRequest ) returns ( HelloResponse );
+
+  rpc LotsOfReplies ( HelloRequest ) returns ( stream HelloResponse );
+
+  rpc LotsOfGreetings ( stream HelloRequest ) returns ( HelloResponse );
+
+  rpc BidiHello ( stream HelloRequest ) returns ( stream HelloResponse );
+}

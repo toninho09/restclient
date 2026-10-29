@@ -26,5 +26,42 @@
     "reveal": "always",
     "show_summary": false,
     "show_command": false
+  },
+  {
+    "label": "▶ Send gRPC Request",
+    "command": "http-client",
+    "args": ["$ZED_FILE", "$ZED_ROW"],
+    "tags": ["grpc-request"],
+    "reveal": "always",
+    "show_summary": false,
+    "show_command": false
+  },
+  {
+    "label": "⊕ Send gRPC in New Tab: $ZED_CUSTOM_url",
+    "command": "http-client",
+    "args": ["$ZED_FILE", "$ZED_ROW"],
+    "tags": ["grpc-request"],
+    "reveal": "always",
+    "use_new_terminal": true,
+    "show_summary": false,
+    "show_command": false
+  },
+  {
+    "label": "📋 Copy as grpcurl",
+    "command": "http-client",
+    "args": ["$ZED_FILE", "$ZED_ROW", "--curl"],
+    "tags": ["grpc-request"],
+    "reveal": "always",
+    "show_summary": false,
+    "show_command": false
+  },
+  {
+    "label": "🔍 Describe gRPC",
+    "command": "http-client",
+    "args": ["$ZED_FILE", "$ZED_ROW", "--describe"],
+    "tags": ["grpc-request"],
+    "reveal": "always",
+    "show_summary": false,
+    "show_command": false
   }
 ]

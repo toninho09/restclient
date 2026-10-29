@@ -12,9 +12,10 @@ capabilities = []
 kind = "Rust"
 version = "0.7.0"
 
+# Fork of rest-nvim/tree-sitter-http that adds the GRPC method
 [grammars.http]
-repository = "https://github.com/rest-nvim/tree-sitter-http"
-rev = "db8b4398de90b6d0b6c780aba96aaa2cd8e9202c"
+repository = "https://github.com/zed-ext/tree-sitter-http"
+rev = "3e77a12324e24170dd46b3e3bc1fe79c33fcea10"
 
 [language_servers.http-lsp]
 name = "HTTP LSP"

@@ -4,4 +4,13 @@
 (request
   method: (method) @run
   url: (target_url) @url
+  (#not-eq? @run "GRPC")
   (#set! tag http-request))
+
+; Mark gRPC requests (GRPC host:port/package.Service/Method) with their own tag,
+; so the gutter shows the gRPC tasks and not the HTTP tasks
+(request
+  method: (method) @run
+  url: (target_url) @url
+  (#eq? @run "GRPC")
+  (#set! tag grpc-request))

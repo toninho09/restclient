@@ -14,6 +14,7 @@ pub enum HttpMethod {
     OPTIONS,
     CONNECT,
     TRACE,
+    GRPC,
 }
 
 impl std::str::FromStr for HttpMethod {
@@ -30,6 +31,7 @@ impl std::str::FromStr for HttpMethod {
             "OPTIONS" => Ok(HttpMethod::OPTIONS),
             "CONNECT" => Ok(HttpMethod::CONNECT),
             "TRACE" => Ok(HttpMethod::TRACE),
+            "GRPC" => Ok(HttpMethod::GRPC),
             _ => Err(format!("Unknown HTTP method: {}", s)),
         }
     }
@@ -47,6 +49,7 @@ impl HttpMethod {
             HttpMethod::OPTIONS => "OPTIONS",
             HttpMethod::CONNECT => "CONNECT",
             HttpMethod::TRACE => "TRACE",
+            HttpMethod::GRPC => "GRPC",
         }
     }
 }
@@ -77,6 +80,33 @@ pub struct RequestMetadata {
     pub end_line: usize,
     pub block_start_line: usize,
     pub name: Option<String>,
+    /// Comment directives before the request line: `# @name value` or `// @name value`.
+    /// The value is `None` for flag directives such as `# @insecure`.
+    pub directives: Vec<(String, Option<String>)>,
+}
+
+impl RequestMetadata {
+    /// Return all values of a directive, in the order of the file.
+    pub fn directive_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.directives
+            .iter()
+            .filter(move |(n, _)| n == name)
+            .filter_map(|(_, v)| v.as_deref())
+    }
+
+    /// Return the last value of a directive.
+    pub fn directive(&self, name: &str) -> Option<&str> {
+        self.directives
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, v)| v.as_deref())
+    }
+
+    /// Return true if the directive is present, with or without a value.
+    pub fn has_directive(&self, name: &str) -> bool {
+        self.directives.iter().any(|(n, _)| n == name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,8 +237,9 @@ fn parse_request_block(
     let lines: Vec<&str> = block.lines().collect();
     let mut line_idx = 0;
 
-    // Skip comments, empty lines, and variable declarations; extract request name
+    // Skip comments, empty lines, and variable declarations; extract directives
     let mut request_name: Option<String> = None;
+    let mut directives: Vec<(String, Option<String>)> = Vec::new();
     while line_idx < lines.len() {
         let line = lines[line_idx].trim();
         if line.is_empty() {
@@ -222,14 +253,14 @@ fn parse_request_block(
             continue;
         }
 
-        // Check for request name: # @name RequestName or // @name RequestName
-        if (line.starts_with("#") || line.starts_with("//")) && line.contains("@name") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(idx) = parts.iter().position(|&p| p == "@name") {
-                if idx + 1 < parts.len() {
-                    request_name = Some(parts[idx + 1].to_string());
+        // Check for directives: # @name RequestName, // @timeout 10, # @insecure
+        if let Some((name, value)) = parse_directive(line) {
+            if name == "name" {
+                if let Some(first) = value.as_deref().and_then(|v| v.split_whitespace().next()) {
+                    request_name = Some(first.to_string());
                 }
             }
+            directives.push((name, value));
             line_idx += 1;
             continue;
         }
@@ -347,12 +378,53 @@ fn parse_request_block(
             end_line,
             block_start_line: start_line,
             name: request_name,
+            directives,
         },
     })
 }
 
+/// Parse a comment directive: `# @name value`, `// @name value` or `# @name=value`.
+/// Return `None` if the line is not a directive comment.
+fn parse_directive(line: &str) -> Option<(String, Option<String>)> {
+    let rest = if let Some(r) = line.strip_prefix("//") {
+        r
+    } else {
+        line.trim_start_matches('#')
+    };
+    if rest.len() == line.len() {
+        return None;
+    }
+
+    let rest = rest.trim_start().strip_prefix('@')?;
+    let name_end = rest
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+
+    let value = rest[name_end..].trim_start_matches('=').trim();
+    let value = (!value.is_empty()).then(|| value.to_string());
+    Some((name.to_string(), value))
+}
+
+/// Find the request at the 1-based `line`. A line between blocks (for example a `###`
+/// separator) selects the next request.
+pub fn request_at_line(requests: &[HttpRequest], line: usize) -> Option<&HttpRequest> {
+    requests
+        .iter()
+        .find(|r| line >= r.metadata.block_start_line && line <= r.metadata.end_line)
+        .or_else(|| {
+            requests
+                .iter()
+                .filter(|r| r.metadata.block_start_line >= line)
+                .min_by_key(|r| r.metadata.block_start_line)
+        })
+}
+
 /// Parse the request line: METHOD URL [HTTP-version]
-fn parse_request_line(line: &str) -> Result<(HttpMethod, String, Option<String>), String> {
+pub fn parse_request_line(line: &str) -> Result<(HttpMethod, String, Option<String>), String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
 
     if parts.len() < 2 {
@@ -383,6 +455,13 @@ fn resolve_request_variables(request: &mut HttpRequest, resolver: &VariableResol
     // Resolve body if present
     if let Some(RequestBody::Inline(body)) = &mut request.body {
         *body = resolver.resolve(body);
+    }
+
+    // Resolve directive values
+    for (_, value) in &mut request.metadata.directives {
+        if let Some(v) = value {
+            *v = resolver.resolve(v);
+        }
     }
 }
 
@@ -576,5 +655,111 @@ GET https://api.example.com/users/{{token}}
             parse_http_file_with_globals(content, &globals).expect("parse should succeed");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url, "https://api.example.com/users/abc123");
+    }
+
+    #[test]
+    fn test_parse_grpc_request() {
+        let content = r#"
+@host = localhost:50051
+
+### Unary call
+GRPC {{host}}/hello.HelloService/SayHello
+authorization: Bearer abc
+
+{
+  "greeting": "zed"
+}
+"#;
+        let requests = parse_http_file(content).unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, HttpMethod::GRPC);
+        assert_eq!(request.method.as_str(), "GRPC");
+        assert_eq!(request.url, "localhost:50051/hello.HelloService/SayHello");
+        assert_eq!(
+            request.headers,
+            vec![("authorization".to_string(), "Bearer abc".to_string())]
+        );
+        assert_eq!(request.metadata.start_line, 5);
+        match &request.body {
+            Some(RequestBody::Inline(body)) => assert!(body.contains(r#""greeting": "zed""#)),
+            other => panic!("Expected inline body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_grpc_host_only() {
+        let content = "GRPC grpcs://grpcb.in:9001\n";
+        let requests = parse_http_file(content).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, HttpMethod::GRPC);
+        assert_eq!(requests[0].url, "grpcs://grpcb.in:9001");
+        assert!(requests[0].body.is_none());
+    }
+
+    #[test]
+    fn test_parse_grpc_many_messages_body() {
+        let content = r#"GRPC localhost:9000/hello.HelloService/LotsOfGreetings
+
+{ "greeting": "a" }
+{ "greeting": "b" }
+"#;
+        let requests = parse_http_file(content).unwrap();
+        match &requests[0].body {
+            Some(RequestBody::Inline(body)) => {
+                assert_eq!(body, "{ \"greeting\": \"a\" }\n{ \"greeting\": \"b\" }")
+            }
+            other => panic!("Expected inline body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_directives() {
+        let content = r#"
+@protoDir = ./proto
+
+### With directives
+# @name sayHello
+# @timeout 10
+// @connection-timeout 2 s
+# @proto {{protoDir}}/hello.proto
+# @proto=other.proto
+# @insecure
+# A plain comment with an @mention
+GRPC localhost:50051/hello.HelloService/SayHello
+"#;
+        let requests = parse_http_file(content).unwrap();
+        assert_eq!(requests.len(), 1);
+        let meta = &requests[0].metadata;
+        assert_eq!(meta.name.as_deref(), Some("sayHello"));
+        assert_eq!(meta.directive("name"), Some("sayHello"));
+        assert_eq!(meta.directive("timeout"), Some("10"));
+        assert_eq!(meta.directive("connection-timeout"), Some("2 s"));
+        assert_eq!(
+            meta.directive_values("proto").collect::<Vec<_>>(),
+            vec!["./proto/hello.proto", "other.proto"]
+        );
+        assert!(meta.has_directive("insecure"));
+        assert_eq!(meta.directive("insecure"), None);
+        assert!(!meta.has_directive("mention"));
+    }
+
+    #[test]
+    fn test_parse_directive_helper() {
+        assert_eq!(
+            parse_directive("# @name foo"),
+            Some(("name".to_string(), Some("foo".to_string())))
+        );
+        assert_eq!(
+            parse_directive("// @no-log"),
+            Some(("no-log".to_string(), None))
+        );
+        assert_eq!(
+            parse_directive("## @timeout=5"),
+            Some(("timeout".to_string(), Some("5".to_string())))
+        );
+        assert_eq!(parse_directive("# plain comment"), None);
+        assert_eq!(parse_directive("# @"), None);
+        assert_eq!(parse_directive("@var = value"), None);
     }
 }

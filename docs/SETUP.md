@@ -4,6 +4,7 @@
 
 - [Rust](https://rustup.rs/) (stable)
 - [Zed IDE](https://zed.dev/)
+- [grpcurl](https://github.com/fullstorydev/grpcurl) (optional, for gRPC requests): `brew install grpcurl`
 
 ## Setup Steps
 
@@ -30,6 +31,17 @@ GET https://httpbin.org/get
 
 You should see **▶ Send Request** and **⊕ Send in New Tab** buttons above the request. Click either one to execute.
 
+To test gRPC (requires grpcurl), add:
+
+```http
+### Test gRPC request
+GRPC grpcb.in:9000/hello.HelloService/SayHello
+
+{
+  "greeting": "Zed"
+}
+```
+
 ## Troubleshooting
 
 **▶ buttons don't appear:**
@@ -40,5 +52,9 @@ You should see **▶ Send Request** and **⊕ Send in New Tab** buttons above th
 **Syntax highlighting not working:**
 - Check file extension is `.http` or `.rest`
 - Restart Zed completely
+
+**gRPC requests fail with "grpcurl not found":**
+- Install grpcurl: `brew install grpcurl`
+- Or set `GRPCURL_PATH` to the full path of the grpcurl binary
 
 See the [README](../README.md) for full documentation.

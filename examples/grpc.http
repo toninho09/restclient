@@ -1,0 +1,113 @@
+# gRPC Requests
+# Demonstrates gRPC calls with the JetBrains HTTP Client syntax: GRPC host:port/package.Service/Method
+# Requires grpcurl: brew install grpcurl
+# All examples use grpcb.in — a free gRPC testing service with server reflection
+# (plaintext on port 9000, TLS on port 9001).
+
+@grpcHost = grpcb.in:9000
+
+### List the services (no method in the target)
+GRPC {{grpcHost}}
+
+### Unary call
+GRPC {{grpcHost}}/hello.HelloService/SayHello
+
+{
+  "greeting": "Zed"
+}
+
+### Unary call over TLS (grpcs://)
+GRPC grpcs://grpcb.in:9001/hello.HelloService/SayHello
+
+{
+  "greeting": "TLS"
+}
+
+### Send metadata (headers become gRPC metadata)
+GRPC {{grpcHost}}/grpcbin.GRPCBin/HeadersUnary
+authorization: Bearer my-secret-token
+x-request-id: zed-123
+
+### Use a host from http-client.env.json
+GRPC {{grpc_host}}/addsvc.Add/Sum
+
+{
+  "a": 2,
+  "b": 3
+}
+
+### ── Streaming ───────────────────────────────────────────────
+
+### Server streaming — messages show when they arrive
+GRPC {{grpcHost}}/hello.HelloService/LotsOfReplies
+
+{
+  "greeting": "stream"
+}
+
+### Client streaming — write one JSON message after another
+GRPC {{grpcHost}}/hello.HelloService/LotsOfGreetings
+
+{ "greeting": "Ada" }
+{ "greeting": "Grace" }
+{ "greeting": "Linus" }
+
+### Bidirectional streaming — sends all messages, then reads the replies
+GRPC {{grpcHost}}/hello.HelloService/BidiHello
+
+{ "greeting": "one" }
+{ "greeting": "two" }
+
+### ── Directives ──────────────────────────────────────────────
+
+### Timeouts (seconds, or a number with ms / s / m)
+# @timeout 5
+# @connection-timeout 2
+GRPC {{grpcHost}}/addsvc.Add/Concat
+
+{
+  "a": "gRPC",
+  "b": " Zed"
+}
+
+### Use a .proto file in place of server reflection
+# @proto ./proto/hello.proto
+GRPC {{grpcHost}}/hello.HelloService/SayHello
+
+{
+  "greeting": "proto file"
+}
+
+### ── Response capture ────────────────────────────────────────
+
+### Capture values from the response
+GRPC {{grpcHost}}/hello.HelloService/SayHello
+
+{
+  "greeting": "capture"
+}
+
+> {%
+  client.global.set("grpc_reply", response.body.reply);
+  client.global.set("grpc_status", response.status);
+%}
+
+###
+
+### Use the captured value
+GRPC {{grpcHost}}/hello.HelloService/SayHello
+x-previous-reply: {{grpc_reply}}
+
+{
+  "greeting": "{{grpc_reply}} (status {{grpc_status}})"
+}
+
+### ── Errors ──────────────────────────────────────────────────
+
+### Non-OK status (NOT_FOUND)
+GRPC {{grpcHost}}/grpcbin.GRPCBin/SpecificError
+
+{
+  "code": 5,
+  "reason": "this resource does not exist"
+}
