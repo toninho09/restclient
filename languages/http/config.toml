@@ -4,7 +4,7 @@ path_suffixes = ["http", "rest"]
 line_comment = "# "
 autoclose_before = ";:.,=}])>"
 word_characters = ["-"]
-completion_query_characters = ["-", ":", "/", "{", " "]
+completion_query_characters = ["-", ":", "/", "{", " ", "@", ".", "\""]
 brackets = [
     { start = "{", end = "}", close = true, newline = true },
     { start = "[", end = "]", close = true, newline = true },

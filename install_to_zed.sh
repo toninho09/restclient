@@ -21,12 +21,12 @@ echo "✅ Built LSP server and http-client"
 echo ""
 
 # Install WASM target
-echo "1. Installing wasm32-wasip1 target..."
-rustup target add wasm32-wasip1 2>&1 | grep -v "info: component" || true
+echo "1. Installing wasm32-wasip2 target..."
+rustup target add wasm32-wasip2 2>&1 | grep -v "info: component" || true
 
 echo ""
 echo "2. Building for WASM..."
-if ! cargo build --release --target wasm32-wasip1 2>&1 | tail -20; then
+if ! cargo build --release --target wasm32-wasip2 2>&1 | tail -20; then
     echo ""
     echo "❌ Build failed. See errors above."
     exit 1
@@ -34,14 +34,25 @@ fi
 
 echo ""
 echo "3. Copying WASM binary..."
-cp target/wasm32-wasip1/release/zed_restclient.wasm extension.wasm
+cp target/wasm32-wasip2/release/zed_restclient.wasm extension.wasm
+
+# Zed loads only WebAssembly components (wasm32-wasip2 output), not core modules (wasm32-wasip1).
+# A component has layer bytes "0d 00 01 00" after the "\0asm" magic.
+if [ "$(od -An -tx1 -j4 -N4 extension.wasm | tr -d ' \n')" != "0d000100" ]; then
+    echo "❌ extension.wasm is not a WebAssembly component. Zed cannot load it."
+    exit 1
+fi
 
 echo "✅ Built extension.wasm ($(ls -lh extension.wasm | awk '{print $5}'))"
 echo ""
 
-# Build grammar if needed
-if [ ! -f "grammars/http.wasm" ]; then
-    echo "4. Building tree-sitter grammar..."
+# Build grammar if it is missing or was built from another revision.
+# The repository and revision come from [grammars.http] in extension.toml.
+GRAMMAR_REPO=$(sed -n '/^\[grammars.http\]/,/^\[/ s/^repository = "\(.*\)"/\1/p' extension.toml)
+GRAMMAR_REV=$(sed -n '/^\[grammars.http\]/,/^\[/ s/^rev = "\(.*\)"/\1/p' extension.toml)
+
+if [ ! -f "grammars/http.wasm" ] || [ "$(cat grammars/http.rev 2>/dev/null)" != "$GRAMMAR_REV" ]; then
+    echo "4. Building tree-sitter grammar ($GRAMMAR_REV)..."
 
     # Install tree-sitter CLI if not present
     if ! command -v tree-sitter &> /dev/null; then
@@ -50,11 +61,12 @@ if [ ! -f "grammars/http.wasm" ]; then
     fi
 
     # Clone and build grammar
-    echo "   Cloning tree-sitter-http..."
+    echo "   Cloning $GRAMMAR_REPO..."
     cd /tmp
     rm -rf tree-sitter-http
-    git clone --depth 1 https://github.com/rest-nvim/tree-sitter-http.git
+    git clone --quiet "$GRAMMAR_REPO" tree-sitter-http
     cd tree-sitter-http
+    git checkout --quiet "$GRAMMAR_REV"
 
     echo "   Compiling grammar to WASM..."
     tree-sitter build --wasm -o http.wasm
@@ -63,10 +75,11 @@ if [ ! -f "grammars/http.wasm" ]; then
     cd "$PROJECT_DIR"
     mkdir -p grammars
     cp /tmp/tree-sitter-http/http.wasm grammars/http.wasm
+    echo "$GRAMMAR_REV" > grammars/http.rev
 
     echo "✅ Built grammar: grammars/http.wasm ($(ls -lh grammars/http.wasm | awk '{print $5}'))"
 else
-    echo "4. Grammar already built: grammars/http.wasm"
+    echo "4. Grammar already built: grammars/http.wasm ($GRAMMAR_REV)"
 fi
 
 echo ""
@@ -126,6 +139,17 @@ if [ -f "target/release/http-client" ]; then
 else
     echo "⚠️  http-client binary not found - task-based execution won't work"
     echo "   Build with: cargo build --release --package http-lsp --bin http-client"
+fi
+echo ""
+
+# gRPC requests (GRPC keyword) run through grpcurl. It is optional.
+echo "6c. Checking grpcurl (for gRPC requests)..."
+if command -v grpcurl &> /dev/null; then
+    echo "✅ Found $(grpcurl -version 2>&1 | head -1)"
+else
+    echo "⚠️  grpcurl not found - GRPC requests won't run (HTTP requests are not affected)"
+    echo "   Install with: brew install grpcurl"
+    echo "   or: go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest"
 fi
 echo ""
 
@@ -253,4 +277,7 @@ echo "4. You should see syntax highlighting and ▶ Run buttons!"
 echo ""
 echo "To test, create test.http with:"
 echo "  GET https://httpbin.org/get"
+echo ""
+echo "For gRPC (requires grpcurl):"
+echo "  GRPC grpcb.in:9000/hello.HelloService/SayHello"
 echo ""

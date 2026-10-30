@@ -1,14 +1,23 @@
 mod completions;
-mod parser;
-mod variables;
 
-use completions::{header_values, AUTH_SCHEMES, HEADER_NAMES, HTTP_METHODS};
-use parser::{parse_http_file, HttpRequest};
+use http_lsp::{convert, grpc, parser, variables};
+
+use completions::{
+    header_values, AUTH_SCHEMES, FLAG_DIRECTIVES, GRPC_METADATA_NAMES, HEADER_NAMES, HTTP_METHODS,
+    REQUEST_DIRECTIVES,
+};
+use grpc::{GrpcCall, GrpcLineContext, GrpcOptions};
+use parser::{
+    parse_http_file, parse_http_file_with_resolver, parse_request_line, request_at_line,
+    HttpMethod, HttpRequest,
+};
 use variables::VariableResolver;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -46,12 +55,30 @@ struct Document {
     content: String,
     version: i32,
     requests: Vec<HttpRequest>,
+    /// The text of the last automatic conversion of a pasted command
+    last_conversion: Option<String>,
 }
+
+/// Time limit for one grpcurl call during completion
+const GRPCURL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a grpcurl result stays in the cache
+const GRPCURL_CACHE_TTL: Duration = Duration::from_secs(60);
+/// How long a failed grpcurl call stays in the cache (prevents a call on each keystroke)
+const GRPCURL_FAILURE_TTL: Duration = Duration::from_secs(10);
+
+/// grpcurl stdout by arguments. `None` means the call failed.
+type GrpcurlCache = HashMap<Vec<String>, (Instant, Option<String>)>;
+
+/// `initialization_options` key. `false` stops the conversion of pasted curl/grpcurl commands.
+const CONVERT_PASTED_OPTION: &str = "convertPastedCurl";
 
 #[derive(Debug)]
 struct HttpLsp {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
+    grpcurl_cache: Arc<RwLock<GrpcurlCache>>,
+    /// Convert pasted curl/grpcurl commands to requests
+    convert_pasted: AtomicBool,
 }
 
 impl HttpLsp {
@@ -59,6 +86,8 @@ impl HttpLsp {
         HttpLsp {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
+            grpcurl_cache: Arc::new(RwLock::new(HashMap::new())),
+            convert_pasted: AtomicBool::new(true),
         }
     }
 
@@ -84,6 +113,7 @@ impl HttpLsp {
                 content: doc.content.clone(),
                 version: doc.version,
                 requests: doc.requests.clone(),
+                last_conversion: None,
             });
         }
         drop(docs);
@@ -96,6 +126,7 @@ impl HttpLsp {
             content,
             version: 0,
             requests,
+            last_conversion: None,
         })
     }
 
@@ -175,21 +206,326 @@ impl HttpLsp {
 
         Ok(runnables)
     }
+
+    /// Run grpcurl with a time limit and return stdout. Results stay in a cache.
+    async fn grpcurl_output(&self, args: Vec<String>) -> Option<String> {
+        if let Some((at, output)) = self.grpcurl_cache.read().await.get(&args) {
+            let ttl = if output.is_some() {
+                GRPCURL_CACHE_TTL
+            } else {
+                GRPCURL_FAILURE_TTL
+            };
+            if at.elapsed() < ttl {
+                return output.clone();
+            }
+        }
+
+        let grpcurl = grpc::find_grpcurl()?;
+        let mut command = tokio::process::Command::new(grpcurl);
+        command
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+
+        let output = match tokio::time::timeout(GRPCURL_TIMEOUT, command.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
+                Some(String::from_utf8_lossy(&out.stdout).to_string())
+            }
+            _ => None,
+        };
+
+        let mut cache = self.grpcurl_cache.write().await;
+        cache.retain(|_, (at, _)| at.elapsed() < GRPCURL_CACHE_TTL);
+        cache.insert(args, (Instant::now(), output.clone()));
+        output
+    }
+
+    /// Return the request type name and its JSON template for the method of `call`.
+    async fn grpc_request_template(&self, call: &GrpcCall) -> Option<(String, String)> {
+        let symbol = call.target.describe_symbol()?;
+        let output = self
+            .grpcurl_output(call.describe_args(&symbol, false))
+            .await?;
+        let descriptor = grpc::parse_method_descriptor(&output)?;
+
+        let output = self
+            .grpcurl_output(call.describe_args(&descriptor.request_type, true))
+            .await?;
+        let template = grpc::parse_message_template(&output)?;
+        Some((descriptor.request_name().to_string(), template))
+    }
+
+    /// Complete the service or the method on a `GRPC` request line
+    async fn grpc_target_completions(
+        &self,
+        uri: &Url,
+        content: &str,
+        ctx: GrpcLineContext,
+        position: Position,
+    ) -> Vec<CompletionItem> {
+        let Some(call) = grpc_call(uri, content, position.line, Some(&ctx.target)) else {
+            return Vec::new();
+        };
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: ctx.replace_start as u32,
+            },
+            end: position,
+        };
+
+        match ctx.service {
+            None => {
+                let Some(output) = self.grpcurl_output(call.list_args()).await else {
+                    return Vec::new();
+                };
+                grpc::parse_list_output(&output)
+                    .into_iter()
+                    .map(|service| {
+                        // Reflection services are rarely the target, so they go last
+                        let rank = if service.starts_with("grpc.reflection.") {
+                            1
+                        } else {
+                            0
+                        };
+                        CompletionItem {
+                            label: service.clone(),
+                            kind: Some(CompletionItemKind::MODULE),
+                            detail: Some("gRPC service".to_string()),
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range,
+                                new_text: format!("{}/", service),
+                            })),
+                            filter_text: Some(service.clone()),
+                            sort_text: Some(format!("{}{}", rank, service)),
+                            ..Default::default()
+                        }
+                    })
+                    .collect()
+            }
+            Some(service) => {
+                let Some(output) = self
+                    .grpcurl_output(call.describe_args(&service, false))
+                    .await
+                else {
+                    return Vec::new();
+                };
+                grpc::parse_service_methods(&output)
+                    .into_iter()
+                    .map(|method| CompletionItem {
+                        label: method.name.clone(),
+                        kind: Some(CompletionItemKind::METHOD),
+                        detail: Some(format!("{} {}", method.kind(), method.signature())),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range,
+                            new_text: method.name.clone(),
+                        })),
+                        filter_text: Some(method.name),
+                        ..Default::default()
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Complete the body of a `GRPC` request:
+    /// - between messages (depth 0): the full request message template;
+    /// - in a message (depth 1): the top-level fields of the request message.
+    async fn grpc_body_completions(
+        &self,
+        uri: &Url,
+        content: &str,
+        position: Position,
+        depth: i32,
+        before_cursor: &str,
+    ) -> Vec<CompletionItem> {
+        if !(0..=1).contains(&depth) {
+            return Vec::new();
+        }
+        let Some(call) = grpc_call(uri, content, position.line, None) else {
+            return Vec::new();
+        };
+        let Some((type_name, template)) = self.grpc_request_template(&call).await else {
+            return Vec::new();
+        };
+
+        // Replace the text typed after the last `{` or `,`
+        let typed_start = before_cursor.rfind(['{', ',']).map(|i| i + 1).unwrap_or(0);
+        let typed = &before_cursor[typed_start..];
+        let typed_start = typed_start + (typed.len() - typed.trim_start().len());
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: typed_start as u32,
+            },
+            end: position,
+        };
+
+        if depth == 0 {
+            return vec![CompletionItem {
+                label: format!("{{}} {}", type_name),
+                kind: Some(CompletionItemKind::SNIPPET),
+                detail: Some("Request message template".to_string()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: template,
+                })),
+                filter_text: Some("{".to_string()),
+                ..Default::default()
+            }];
+        }
+
+        let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(&template) else {
+            return Vec::new();
+        };
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, (name, value))| CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(format!("{}: {}", type_name, value)),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: format!("\"{}\": {}", name, value),
+                })),
+                filter_text: Some(format!("\"{}\"", name)),
+                sort_text: Some(format!("{:03}", i)),
+                ..Default::default()
+            })
+            .collect()
+    }
+}
+
+/// Build the grpcurl context for the request at `line` (0-based).
+/// Variables resolve with file variables and the active environment.
+/// `target` replaces the request URL (the request line that the user edits).
+fn grpc_call(uri: &Url, content: &str, line: u32, target: Option<&str>) -> Option<GrpcCall> {
+    let base_dir = uri.to_file_path().ok()?.parent()?.to_path_buf();
+    let mut resolver = VariableResolver::new();
+    resolver.load_environments_from_dir(&base_dir);
+    let requests = parse_http_file_with_resolver(content, &mut resolver).unwrap_or_default();
+
+    let request =
+        request_at_line(&requests, line as usize + 1).filter(|r| r.method == HttpMethod::GRPC);
+
+    let url = match target {
+        Some(t) => resolver.resolve(t),
+        None => request?.url.clone(),
+    };
+    let opts = request
+        .and_then(|r| {
+            GrpcOptions::from_request(r, &base_dir, resolver.get_ssl_configuration()).ok()
+        })
+        .unwrap_or_default();
+
+    Some(GrpcCall {
+        target: grpc::parse_target(&url).ok()?,
+        opts,
+        headers: request.map(|r| r.headers.clone()).unwrap_or_default(),
+    })
+}
+
+/// Return true for a request line: `METHOD target`
+fn is_request_line(line: &str) -> bool {
+    parse_request_line(line).is_ok()
+}
+
+/// Return true for a `GRPC ...` request line, also when the target is not complete
+fn is_grpc_request_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("GRPC")
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+/// The LSP edit of a converted curl/grpcurl command
+fn replacement_edit(replacement: &convert::Replacement) -> TextEdit {
+    TextEdit {
+        range: Range {
+            start: Position {
+                line: replacement.start_line,
+                character: 0,
+            },
+            end: Position {
+                line: replacement.end_line,
+                character: replacement.end_character,
+            },
+        },
+        new_text: replacement.new_text.clone(),
+    }
+}
+
+/// Complete comment directives: `# @name`, `// @timeout`
+fn directive_completions(before_cursor: &str, position: Position) -> Option<CompletionResponse> {
+    let at = before_cursor.rfind('@')?;
+    let marker = before_cursor[..at].trim();
+    let is_marker = marker == "//" || (!marker.is_empty() && marker.chars().all(|c| c == '#'));
+    let typed = &before_cursor[at + 1..];
+    if !is_marker || typed.contains(char::is_whitespace) {
+        return None;
+    }
+
+    let items = REQUEST_DIRECTIVES
+        .iter()
+        .map(|(name, desc)| {
+            let new_text = if FLAG_DIRECTIVES.contains(name) {
+                format!("@{}", name)
+            } else {
+                format!("@{} ", name)
+            };
+            CompletionItem {
+                label: format!("@{}", name),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some(desc.to_string()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: position.line,
+                            character: at as u32,
+                        },
+                        end: position,
+                    },
+                    new_text,
+                })),
+                filter_text: Some(format!("@{}", name)),
+                ..Default::default()
+            }
+        })
+        .collect();
+    Some(CompletionResponse::Array(items))
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for HttpLsp {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let enabled = params
+            .initialization_options
+            .as_ref()
+            .and_then(|options| options.get(CONVERT_PASTED_OPTION))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        // The conversion of pasted commands sends `workspace/applyEdit` to the client
+        let apply_edit = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.apply_edit)
+            .unwrap_or(false);
+        self.convert_pasted
+            .store(enabled && apply_edit, Ordering::Relaxed);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(
-                        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ :/{"
+                        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ :/{@\"."
                             .chars()
                             .map(|c| c.to_string())
                             .collect(),
@@ -218,6 +554,7 @@ impl LanguageServer for HttpLsp {
             content,
             version,
             requests,
+            last_conversion: None,
         };
         let mut docs = self.documents.write().await;
         docs.insert(uri, doc);
@@ -227,16 +564,68 @@ impl LanguageServer for HttpLsp {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        if let Some(change) = params.content_changes.into_iter().last() {
-            let requests = parse_http_file(&change.text).unwrap_or_default();
-            let doc = Document {
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+
+        let mut docs = self.documents.write().await;
+        let previous = docs.remove(&uri);
+        let mut last_conversion = previous.as_ref().and_then(|d| d.last_conversion.clone());
+
+        let pasted = previous
+            .filter(|_| self.convert_pasted.load(Ordering::Relaxed))
+            .and_then(|d| convert::pasted_replacement(&d.content, &change.text))
+            // An undo of a conversion puts the command back: do not convert it again
+            .filter(|(_, removed)| {
+                let removed = removed.trim();
+                removed.is_empty()
+                    || !last_conversion
+                        .as_deref()
+                        .is_some_and(|text| text.contains(removed))
+            })
+            .map(|(replacement, _)| replacement);
+        if let Some(replacement) = &pasted {
+            last_conversion = Some(replacement.new_text.clone());
+        }
+
+        let requests = parse_http_file(&change.text).unwrap_or_default();
+        docs.insert(
+            uri.clone(),
+            Document {
                 content: change.text,
                 version,
                 requests,
-            };
-            let mut docs = self.documents.write().await;
-            docs.insert(uri, doc);
-        }
+                last_conversion,
+            },
+        );
+        drop(docs);
+
+        let Some(replacement) = pasted else {
+            return;
+        };
+        // The version makes the client reject the edit if the document changed again
+        let edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: Some(version),
+                },
+                edits: vec![OneOf::Left(replacement_edit(&replacement))],
+            }])),
+            ..Default::default()
+        };
+        // Do not wait for the response here: the client sends a didChange before it
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.apply_edit(edit).await {
+                client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Failed to convert the pasted command: {}", e),
+                    )
+                    .await;
+            }
+        });
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -276,10 +665,16 @@ impl LanguageServer for HttpLsp {
             let start_line = request.metadata.start_line.saturating_sub(1) as u32;
             let end_line = request.metadata.end_line.saturating_sub(1) as u32;
 
+            let detail = if request.method == HttpMethod::GRPC {
+                "gRPC Request"
+            } else {
+                "HTTP Request"
+            };
+
             #[allow(deprecated)]
             let symbol = DocumentSymbol {
                 name: format!("{:?} {}", request.method, request.url),
-                detail: Some("HTTP Request".to_string()),
+                detail: Some(detail.to_string()),
                 kind: SymbolKind::METHOD,
                 tags: None,
                 deprecated: None,
@@ -341,8 +736,26 @@ impl LanguageServer for HttpLsp {
         let is_separator = full_line_trimmed.starts_with("###");
         let is_comment = full_line_trimmed.starts_with('#') || full_line_trimmed.starts_with("//");
 
-        if is_separator || is_comment {
+        // --- Directives: # @name, // @timeout ---
+        if is_comment && !is_separator {
+            return Ok(directive_completions(before_cursor, position));
+        }
+
+        if is_separator {
             return Ok(None);
+        }
+
+        // --- gRPC request line: GRPC host:port/package.Service/Method ---
+        if is_grpc_request_line(current_line) {
+            let Some(ctx) = grpc::grpc_line_context(current_line, char_pos) else {
+                return Ok(None);
+            };
+            let content = doc.content.clone();
+            drop(docs);
+            let items = self
+                .grpc_target_completions(&uri, &content, ctx, position)
+                .await;
+            return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
         }
 
         let line_has_url =
@@ -359,28 +772,35 @@ impl LanguageServer for HttpLsp {
             .map(|i| i + 1)
             .unwrap_or(0);
 
-        let has_request_line_before_cursor = (block_start..position.line as usize).any(|i| {
-            let l = lines[i].trim();
-            if l.is_empty() || l.starts_with('#') || l.starts_with("//") {
-                return false;
+        let request_line_idx =
+            (block_start..position.line as usize).find(|&i| is_request_line(lines[i]));
+        let has_request_line_before_cursor = request_line_idx.is_some();
+        let block_is_grpc = request_line_idx.is_some_and(|i| is_grpc_request_line(lines[i]));
+
+        // --- gRPC body: message template and fields ---
+        if let Some(request_idx) = request_line_idx.filter(|_| block_is_grpc) {
+            let cursor_idx = position.line as usize;
+            let body_start = (request_idx + 1..cursor_idx).find(|&i| lines[i].trim().is_empty());
+            if let Some(body_start) = body_start {
+                let mut body = lines[body_start + 1..cursor_idx].join("\n");
+                // The response handler (> {% ... %}) is not part of the message
+                if body.lines().any(|l| l.trim_start().starts_with('>')) || trimmed.starts_with('>')
+                {
+                    return Ok(None);
+                }
+                body.push('\n');
+                body.push_str(before_cursor);
+                let depth = grpc::json_nesting_depth(&body);
+
+                let content = doc.content.clone();
+                let before_cursor = before_cursor.to_string();
+                drop(docs);
+                let items = self
+                    .grpc_body_completions(&uri, &content, position, depth, &before_cursor)
+                    .await;
+                return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
             }
-            let mut parts = l.split_whitespace();
-            let first = parts.next().unwrap_or("").to_ascii_uppercase();
-            let second = parts.next().unwrap_or("");
-            !second.is_empty()
-                && matches!(
-                    first.as_str(),
-                    "GET"
-                        | "POST"
-                        | "PUT"
-                        | "PATCH"
-                        | "DELETE"
-                        | "HEAD"
-                        | "OPTIONS"
-                        | "CONNECT"
-                        | "TRACE"
-                )
-        });
+        }
 
         let first_meaningful_line_in_block = (block_start..=position.line as usize).find(|&i| {
             let l = lines[i].trim();
@@ -448,7 +868,12 @@ impl LanguageServer for HttpLsp {
         if typing_header_name {
             let prefix = trimmed.to_lowercase();
             let replace_start = line_start_char;
-            for (header, default_value) in HEADER_NAMES {
+            let header_names = if block_is_grpc {
+                GRPC_METADATA_NAMES
+            } else {
+                HEADER_NAMES
+            };
+            for (header, default_value) in header_names {
                 if prefix.is_empty() || header.to_lowercase().starts_with(&prefix) {
                     let new_text = format!("{}: ", header);
                     items.push(CompletionItem {
@@ -634,6 +1059,39 @@ impl LanguageServer for HttpLsp {
         }
     }
 
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let docs = self.documents.read().await;
+        let Some(doc) = docs.get(&uri) else {
+            return Ok(None);
+        };
+
+        let line = params.range.start.line as usize;
+        let Some(replacement) = convert::command_at(&doc.content, line)
+            .and_then(|(start, end)| convert::convert_lines(&doc.content, start, end))
+        else {
+            return Ok(None);
+        };
+
+        let title = match replacement.kind {
+            convert::CommandKind::Curl => "Convert cURL to HTTP request",
+            convert::CommandKind::Grpcurl => "Convert grpcurl to gRPC request",
+        };
+        let edit = WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![replacement_edit(&replacement)],
+            )])),
+            ..Default::default()
+        };
+        Ok(Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: title.to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(edit),
+            ..Default::default()
+        })]))
+    }
+
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
@@ -641,6 +1099,9 @@ impl LanguageServer for HttpLsp {
 
 #[tokio::main]
 async fn main() {
+    // Zed starts the LSP with its crash handler ports. grpcurl (completions) does not work with them.
+    grpc::reset_exception_ports();
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 

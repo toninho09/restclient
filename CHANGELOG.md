@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- gRPC requests with the JetBrains syntax `GRPC host:port/package.Service/Method`, executed with grpcurl
+- Plaintext (`grpc://` or no scheme) and TLS (`grpcs://`) connections
+- Unary, server-streaming, client-streaming, and bidirectional calls; server-stream messages show when they arrive
+- gRPC metadata from headers, JSON request messages from the body or from a `< file` reference
+- `GRPC host` lists the services; `GRPC host/package.Service` shows the methods
+- Request directives: `@timeout`, `@connection-timeout`, `@proto`, `@import-path`, `@protoset`, `@insecure`, `@cacert`, `@cert`, `@key`, `@authority`, `@emit-defaults`
+- gRPC tasks: ▶ Send gRPC Request, ⊕ Send gRPC in New Tab, 📋 Copy as grpcurl, 🔍 Describe gRPC
+- gRPC completion: services, methods, request message template and fields (server reflection or `.proto` files), metadata keys
+- Completion of `# @` directives
+- Response capture for gRPC: `response.body` (last message), `response.status` (gRPC code), `response.headers.valueOf()` (headers and trailers)
+- JetBrains `SSLConfiguration` in environment files (`clientCertificate`, `clientCertificateKey`, `verifyHostCertificate`)
+- `examples/grpc.http` and `examples/proto/hello.proto`
+- Paste a `curl` or `grpcurl` command in a `.http` file: the LSP replaces it with a request block (JetBrains behavior). `Cmd+Z` gets the command back. Set `"convertPastedCurl": false` in `lsp.http-lsp.initialization_options` to turn it off
+- Code actions: Convert cURL to HTTP request, Convert grpcurl to gRPC request
+- curl conversion: method, headers, `-d`/`--data-*`/`--json`, `-F` multipart, `-u` basic auth, `--oauth2-bearer`, cookies, `-G`, `-I`, `-T`; Chrome "Copy as cURL (bash)" quoting (`$'...'`)
+- grpcurl conversion: TLS or `-plaintext`, `-d` messages, `-H` metadata, flags to directives (`-proto` → `# @proto`, `-max-time` → `# @timeout`, ...)
+- HTTP request bodies from a file (`< ./file`) and `multipart/form-data` bodies with `< ./file` parts
+- 📋 Generate cURL: a `< ./file` body becomes `--data-binary @file`
+
+### Changed
+- A body is a file reference only when it is one `< path` line. A body that starts with `<` and has no space after it (for example `<?xml ...>`) is inline text
+- Grammar: fork of tree-sitter-http with the `GRPC` method, so `GRPC` highlights as a keyword
+- `install_to_zed.sh` builds the grammar at the `rev` of `extension.toml` and checks for grpcurl
+
+### Fixed
+- macOS: gRPC requests and gRPC completions stopped at "Waiting..." when Zed started them. Child processes get the Mach exception ports of Zed's crash handler, and grpcurl (Go) stops at its first memory fault. `http-client` and `http-lsp` now reset these ports at startup
+- Environment files with number, boolean, or object values (for example `SSLConfiguration`) failed to load
+- `install_to_zed.sh` built a `wasm32-wasip1` core module, which Zed cannot load ("attempted to parse a wasm module with a component parser"), so the LSP never started. The extension now builds for `wasm32-wasip2` (a WebAssembly component), and the script stops if the output is not a component
+
 ## [0.2.1] - 2026-03-14
 
 ### Added

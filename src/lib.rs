@@ -1,4 +1,4 @@
-use zed_extension_api::{self as zed, Result};
+use zed_extension_api::{self as zed, settings::LspSettings, Result};
 
 struct RestClientExtension {}
 
@@ -36,12 +36,18 @@ impl zed::Extension for RestClientExtension {
         })
     }
 
+    /// Pass the user settings to the LSP:
+    /// `"lsp": { "http-lsp": { "initialization_options": { "convertPastedCurl": false } } }`
     fn language_server_initialization_options(
         &mut self,
-        _language_server_id: &zed::LanguageServerId,
-        _worktree: &zed::Worktree,
+        language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
     ) -> Result<Option<serde_json::Value>> {
-        Ok(None)
+        Ok(
+            LspSettings::for_worktree(language_server_id.as_ref(), worktree)
+                .ok()
+                .and_then(|settings| settings.initialization_options),
+        )
     }
 
     fn language_server_workspace_configuration(

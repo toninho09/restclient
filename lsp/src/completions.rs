@@ -8,6 +8,7 @@ pub const HTTP_METHODS: &[(&str, &str)] = &[
     ("OPTIONS", "Get allowed methods"),
     ("CONNECT", "Establish tunnel"),
     ("TRACE", "Loop-back test"),
+    ("GRPC", "gRPC call (grpcurl)"),
 ];
 
 pub const HEADER_NAMES: &[(&str, &str)] = &[
@@ -43,6 +44,45 @@ pub const HEADER_NAMES: &[(&str, &str)] = &[
 ];
 
 pub const AUTH_SCHEMES: &[&str] = &["Bearer ", "Basic ", "Token "];
+
+/// Common gRPC metadata keys (lowercase, as gRPC sends them)
+pub const GRPC_METADATA_NAMES: &[(&str, &str)] = &[
+    ("authorization", "Bearer "),
+    ("x-api-key", ""),
+    ("x-request-id", ""),
+    ("x-correlation-id", ""),
+    ("x-tenant-id", ""),
+    ("user-agent", "RestClient/1.0"),
+    ("accept-language", "en-US"),
+];
+
+/// Comment directives (`# @name value`) and their descriptions
+pub const REQUEST_DIRECTIVES: &[(&str, &str)] = &[
+    ("name", "Request name"),
+    ("timeout", "gRPC: total time limit (10, 1.5s, 500ms, 2m)"),
+    (
+        "connection-timeout",
+        "gRPC: connection time limit (10, 1.5s, 500ms, 2m)",
+    ),
+    (
+        "proto",
+        "gRPC: .proto file to use in place of server reflection",
+    ),
+    ("import-path", "gRPC: directory for .proto imports"),
+    ("protoset", "gRPC: compiled FileDescriptorSet file"),
+    ("insecure", "gRPC: skip TLS certificate verification"),
+    ("cacert", "gRPC: trusted root certificates file"),
+    ("cert", "gRPC: client certificate file (mutual TLS)"),
+    ("key", "gRPC: client private key file (mutual TLS)"),
+    ("authority", "gRPC: value of the :authority header"),
+    (
+        "emit-defaults",
+        "gRPC: show fields that have default values",
+    ),
+];
+
+/// Directives that take no value
+pub const FLAG_DIRECTIVES: &[&str] = &["insecure", "emit-defaults"];
 
 pub fn header_values(name: &str) -> &'static [&'static str] {
     match name {

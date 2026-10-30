@@ -70,3 +70,5 @@ src/tree_sitter/
 
 # Built extension (generated during build)
 extension.wasm
+
+.codegraph

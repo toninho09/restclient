@@ -1,18 +1,67 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Environment {
-    #[serde(flatten)]
     pub variables: HashMap<String, String>,
+    /// The `SSLConfiguration` object of the environment
+    pub ssl: Option<SslConfiguration>,
 }
 
 /// Standard JetBrains HTTP Client environment file names
 pub const ENV_FILE_PUBLIC: &str = "http-client.env.json";
 pub const ENV_FILE_PRIVATE: &str = "http-client.private.env.json";
+
+/// Key of the JetBrains SSL settings object inside an environment
+pub const SSL_CONFIGURATION_KEY: &str = "SSLConfiguration";
+
+/// JetBrains `SSLConfiguration` block of an environment.
+/// Certificate paths are absolute: relative paths resolve against the env file directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SslConfiguration {
+    pub client_certificate: Option<PathBuf>,
+    pub client_certificate_key: Option<PathBuf>,
+    pub verify_host_certificate: Option<bool>,
+}
+
+impl SslConfiguration {
+    /// Parse the JSON object. A certificate is a path string or `{ "path": "..." }`.
+    fn from_json(value: &serde_json::Value, base_dir: &Path) -> Self {
+        let cert_path = |key: &str| {
+            let v = value.get(key)?;
+            let path = v
+                .as_str()
+                .or_else(|| v.get("path").and_then(|p| p.as_str()))?;
+            Some(base_dir.join(path))
+        };
+        Self {
+            client_certificate: cert_path("clientCertificate"),
+            client_certificate_key: cert_path("clientCertificateKey"),
+            verify_host_certificate: value.get("verifyHostCertificate").and_then(|v| v.as_bool()),
+        }
+    }
+
+    /// Override the fields that `other` sets.
+    fn merge(&mut self, other: SslConfiguration) {
+        if other.client_certificate.is_some() {
+            self.client_certificate = other.client_certificate;
+        }
+        if other.client_certificate_key.is_some() {
+            self.client_certificate_key = other.client_certificate_key;
+        }
+        if other.verify_host_certificate.is_some() {
+            self.verify_host_certificate = other.verify_host_certificate;
+        }
+    }
+}
+
+/// Content of one environment file
+struct EnvironmentsFile {
+    active_env: Option<String>,
+    environments: HashMap<String, Environment>,
+}
 
 pub struct VariableResolver {
     environments: HashMap<String, Environment>,
@@ -41,33 +90,10 @@ impl VariableResolver {
     /// Load environments from a single JSON file.
     /// Expects `"activeEnv"` key to specify the active environment.
     pub fn load_environments<P: AsRef<Path>>(&mut self, path: P) -> Result<(), String> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read environments file: {}", e))?;
+        let file = Self::read_environments(path.as_ref())?;
+        let active_env = file.active_env;
 
-        let value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse environments JSON: {}", e))?;
-
-        let obj = value
-            .as_object()
-            .ok_or("Expected JSON object at top level")?;
-
-        let active_env = obj
-            .get("activeEnv")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Parse all keys except "activeEnv" as environments
-        let mut envs = HashMap::new();
-        for (key, val) in obj {
-            if key == "activeEnv" {
-                continue;
-            }
-            let env: Environment = serde_json::from_value(val.clone())
-                .map_err(|e| format!("Failed to parse environment '{}': {}", key, e))?;
-            envs.insert(key.clone(), env);
-        }
-
-        self.environments = envs;
+        self.environments = file.environments;
 
         if let Some(name) = &active_env {
             if self.environments.contains_key(name) {
@@ -102,28 +128,27 @@ impl VariableResolver {
 
         let private_file = search_dir.join(ENV_FILE_PRIVATE);
         if private_file.exists() {
-            match Self::read_environments(&private_file) {
-                Ok(private_envs) => {
-                    for (env_name, private_env) in private_envs {
-                        let entry =
-                            self.environments
-                                .entry(env_name)
-                                .or_insert_with(|| Environment {
-                                    variables: HashMap::new(),
-                                });
-                        for (key, value) in private_env.variables {
-                            entry.variables.insert(key, value);
-                        }
+            if let Ok(private) = Self::read_environments(&private_file) {
+                for (env_name, private_env) in private.environments {
+                    let entry = self.environments.entry(env_name).or_default();
+                    entry.variables.extend(private_env.variables);
+                    if let Some(private_ssl) = private_env.ssl {
+                        entry
+                            .ssl
+                            .get_or_insert_with(Default::default)
+                            .merge(private_ssl);
                     }
                 }
-                Err(_e) => {}
             }
         }
 
         !self.environments.is_empty()
     }
 
-    fn read_environments(path: &Path) -> Result<HashMap<String, Environment>, String> {
+    /// Read one environment file (JetBrains format).
+    /// String values become variables. Numbers and booleans become strings.
+    /// `SSLConfiguration` goes to `Environment::ssl`. Other objects, arrays and null are ignored.
+    fn read_environments(path: &Path) -> Result<EnvironmentsFile, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         let value: serde_json::Value = serde_json::from_str(&content)
@@ -131,16 +156,48 @@ impl VariableResolver {
         let obj = value
             .as_object()
             .ok_or_else(|| format!("Expected JSON object in {}", path.display()))?;
-        let mut envs = HashMap::new();
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+        let mut file = EnvironmentsFile {
+            active_env: obj
+                .get("activeEnv")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            environments: HashMap::new(),
+        };
+
         for (key, val) in obj {
             if key == "activeEnv" {
                 continue;
             }
-            let env: Environment = serde_json::from_value(val.clone())
-                .map_err(|e| format!("Failed to parse environment '{}': {}", key, e))?;
-            envs.insert(key.clone(), env);
+            let env_obj = val
+                .as_object()
+                .ok_or_else(|| format!("Failed to parse environment '{}': expected object", key))?;
+
+            let mut env = Environment::default();
+            for (name, v) in env_obj {
+                let text = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Object(_) if name == SSL_CONFIGURATION_KEY => {
+                        env.ssl = Some(SslConfiguration::from_json(v, base_dir));
+                        continue;
+                    }
+                    _ => continue,
+                };
+                env.variables.insert(name.clone(), text);
+            }
+            file.environments.insert(key.clone(), env);
         }
-        Ok(envs)
+
+        Ok(file)
+    }
+
+    /// Return the `SSLConfiguration` of the active environment.
+    pub fn get_ssl_configuration(&self) -> Option<&SslConfiguration> {
+        let env_name = self.active_environment.as_ref()?;
+        self.environments.get(env_name)?.ssl.as_ref()
     }
 
     /// Set the active environment
@@ -389,9 +446,7 @@ mod tests {
         // Set up different levels
         env::set_var("TEST_VAR", "from_system");
 
-        let mut env = Environment {
-            variables: HashMap::new(),
-        };
+        let mut env = Environment::default();
         env.variables
             .insert("TEST_VAR".to_string(), "from_environment".to_string());
         resolver.environments.insert("dev".to_string(), env);
@@ -612,5 +667,65 @@ GET {{base_url}}/users
         assert!(result.unwrap_err().contains("nonexistent"));
 
         fs::remove_file(&temp_file).ok();
+    }
+
+    #[test]
+    fn test_non_string_values_and_ssl_configuration() {
+        let temp_dir = std::env::temp_dir().join("test_env_ssl_configuration");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let public = r#"{
+            "activeEnv": "dev",
+            "dev": {
+                "host": "localhost",
+                "port": 50051,
+                "debug": true,
+                "nothing": null,
+                "list": [1, 2],
+                "SSLConfiguration": {
+                    "clientCertificate": "certs/client.pem",
+                    "clientCertificateKey": { "path": "certs/client.key", "format": "PEM" },
+                    "verifyHostCertificate": true
+                }
+            },
+            "prod": { "host": "prod.example.com" }
+        }"#;
+        fs::write(temp_dir.join(ENV_FILE_PUBLIC), public).unwrap();
+
+        let private = r#"{
+            "dev": {
+                "SSLConfiguration": { "verifyHostCertificate": false }
+            }
+        }"#;
+        fs::write(temp_dir.join(ENV_FILE_PRIVATE), private).unwrap();
+
+        let mut resolver = VariableResolver::new();
+        assert!(resolver.load_environments_from_dir(&temp_dir));
+
+        assert_eq!(resolver.get_variable("port"), Some("50051".to_string()));
+        assert_eq!(resolver.get_variable("debug"), Some("true".to_string()));
+        assert_eq!(resolver.get_variable("nothing"), None);
+        assert_eq!(resolver.get_variable("list"), None);
+        assert_eq!(resolver.get_variable(SSL_CONFIGURATION_KEY), None);
+
+        let ssl = resolver
+            .get_ssl_configuration()
+            .expect("dev has SSL config");
+        assert_eq!(
+            ssl.client_certificate,
+            Some(temp_dir.join("certs/client.pem"))
+        );
+        assert_eq!(
+            ssl.client_certificate_key,
+            Some(temp_dir.join("certs/client.key"))
+        );
+        // The private file overrides the public value
+        assert_eq!(ssl.verify_host_certificate, Some(false));
+
+        resolver.set_active_environment("prod".to_string()).unwrap();
+        assert!(resolver.get_ssl_configuration().is_none());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
