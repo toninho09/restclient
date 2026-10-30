@@ -1,7 +1,7 @@
 id = "restclient"
 name = "REST Client"
 description = "HTTP client for testing REST APIs with .http files"
-version = "0.2.1"
+version = "0.3.0"
 schema_version = 1
 authors = ["Tong Zhou"]
 repository = "https://github.com/zed-ext/restclient"

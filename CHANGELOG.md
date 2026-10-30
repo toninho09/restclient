@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-29
+
 ### Added
 - gRPC requests with the JetBrains syntax `GRPC host:port/package.Service/Method`, executed with grpcurl
 - Plaintext (`grpc://` or no scheme) and TLS (`grpcs://`) connections
